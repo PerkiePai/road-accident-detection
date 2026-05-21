@@ -1,0 +1,29 @@
+# Video files
+*.mp4
+*.avi
+*.mov
+
+# YOLO weights
+*.pt
+
+# Generated calibration / homography arrays
+*.npy
+*.png
+
+# Output directories
+bbox_mp4/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Claude Code
+CLAUDE.md
+
+# Misc
+.DS_Store
+Thumbs.db
