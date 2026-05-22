@@ -7,8 +7,8 @@ import numpy as np
 from ultralytics import YOLO
 
 # ─── Config ────────────────────────────────────────────────────
-INPUT_VIDEO   = "in/thai_road_full.mp4"
-OUTPUT_VIDEO  = "thai_road_full_tracked.mp4"
+INPUT_VIDEO   = "in/accident_cm_in_p1.mp4"
+OUTPUT_VIDEO  = "accident_cm_in_p1_tracked3D.mp4"
 H_PATH        = "H_manual.npy"
 SRC_PATH      = "src_manual.npy"
 TRACK_PATH    = "track_manual.npy"
@@ -28,6 +28,8 @@ REID_MAX_GAP_S      = 2.0    # max time a lost track stays a candidate
 REID_LOW_VEL_GAP_S  = 1.0    # tighter window for ~stopped cars
 REID_LOW_VEL_THRESH = 1.0    # m/s — below this counts as "stopped"
 
+VEHICLE_L_M = 4.0           # assumed vehicle depth for pseudo-3D box (metres)
+
 # ─── Calibration ───────────────────────────────────────────────
 if not (os.path.exists(H_PATH) and os.path.exists(SRC_PATH) and os.path.exists(TRACK_PATH)):
     raise SystemExit(
@@ -36,6 +38,7 @@ if not (os.path.exists(H_PATH) and os.path.exists(SRC_PATH) and os.path.exists(T
     )
 
 H = np.load(H_PATH)
+H_inv = np.linalg.inv(H)
 src_rect   = np.load(SRC_PATH).astype(np.int32)    # 4-pt homography rectangle (reference)
 road_poly  = np.load(TRACK_PATH).astype(np.int32)  # N-pt tracking region
 
@@ -74,6 +77,61 @@ def project_to_ground(px, py):
     pt = np.array([[[px, py]]], dtype=np.float32)
     xz = cv2.perspectiveTransform(pt, H)[0, 0]
     return float(xz[0]), float(xz[1])  # x_m, z_m
+
+
+def _ground_to_img_pt(x_m, z_m):
+    pt = np.array([[[x_m, z_m]]], dtype=np.float32)
+    px = cv2.perspectiveTransform(pt, H_inv)[0, 0]
+    return float(px[0]), float(px[1])
+
+
+def draw_pseudo3d_box(frame, dx1, dy1, dx2, dy2, s_z_m, color):
+    """Homography-projected pseudo-3D wireframe box. Falls back to cv2.rectangle
+    when geometry is degenerate. Returns (label_x, label_y) text anchor."""
+    h_px = dy2 - dy1
+    if h_px <= 0 or s_z_m <= 0:
+        cv2.rectangle(frame, (dx1, dy1), (dx2, dy2), color, 2)
+        return dx1, dy1 - 8
+
+    x_l_m, _ = project_to_ground(dx1, dy2)
+    x_r_m, _ = project_to_ground(dx2, dy2)
+
+    z_front = s_z_m + VEHICLE_L_M / 2   # near camera (larger z)
+    z_back  = s_z_m - VEHICLE_L_M / 2   # far from camera (smaller z)
+
+    corners_m = [
+        (x_l_m, z_front),   # near-left
+        (x_r_m, z_front),   # near-right
+        (x_r_m, z_back),    # far-right
+        (x_l_m, z_back),    # far-left
+    ]
+
+    if any(zm <= 0 for _, zm in corners_m):
+        cv2.rectangle(frame, (dx1, dy1), (dx2, dy2), color, 2)
+        return dx1, dy1 - 8
+
+    bot = [_ground_to_img_pt(xm, zm) for xm, zm in corners_m]
+
+    # Larger z_m = closer to camera = taller apparent height in image.
+    top = [
+        (bx, by - h_px * (zm / s_z_m))
+        for (_, zm), (bx, by) in zip(corners_m, bot)
+    ]
+
+    B = [(int(round(x)), int(round(y))) for x, y in bot]
+    T = [(int(round(x)), int(round(y))) for x, y in top]
+
+    for i, j in [(0, 1), (1, 2), (2, 3), (3, 0)]:
+        cv2.line(frame, B[i], B[j], color, 2, cv2.LINE_AA)
+    for k in range(4):
+        cv2.line(frame, B[k], T[k], color, 1, cv2.LINE_AA)
+    for i, j in [(0, 1), (1, 2), (2, 3), (3, 0)]:
+        cv2.line(frame, T[i], T[j], color, 1, cv2.LINE_AA)
+
+    all_pts = bot + top
+    label_x = int(min(x for x, _ in all_pts))
+    label_y = int(min(y for _, y in all_pts)) - 8
+    return label_x, label_y
 
 
 class ReIDStitcher:
@@ -350,9 +408,9 @@ while cap.isOpened():
         label_parts.append(f"d={s_z_m:.1f}m")
         label = " ".join(label_parts)
 
-        cv2.rectangle(frame, (dx1, dy1), (dx2, dy2), color, 2)
+        lx, ly = draw_pseudo3d_box(frame, dx1, dy1, dx2, dy2, s_z_m, color)
         cv2.circle(frame, (dgx, dgy), 4, (0, 255, 255), -1)
-        cv2.putText(frame, label, (dx1, dy1 - 8),
+        cv2.putText(frame, label, (lx, ly),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
 
     # prune stale ema + bbox + speed_history entries (track gone for > 2s)

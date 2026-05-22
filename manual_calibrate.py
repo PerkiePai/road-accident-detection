@@ -183,7 +183,7 @@ class ManualCalibrator:
 
 
 if __name__ == "__main__":
-    cap = cv2.VideoCapture("in/thai_road_full.mp4")
+    cap = cv2.VideoCapture("in/accident_cm_in_p1.mp4")
     calib = ManualCalibrator(lane_width_m=7.0, road_depth_m=7.0)
     H, src = calib.calibrate(cap, save_path="H_manual.npy")
     print("H =")
