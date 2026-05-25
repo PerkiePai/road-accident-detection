@@ -15,8 +15,9 @@ class ManualCalibrator:
     """
 
     POINT_LABELS = ["bottom-left", "bottom-right", "top-right", "top-left"]
+    DISPLAY_MAX  = (1280, 720)   # max window size on screen
 
-    def __init__(self, lane_width_m=7.0, road_depth_m=7.0):
+    def __init__(self, lane_width_m=7.0, road_depth_m=10.0):
         self.lane_width_m = lane_width_m
         self.road_depth_m = road_depth_m
 
@@ -25,23 +26,34 @@ class ManualCalibrator:
         self.track_poly = None   # N tracking-region points
         self.shape = None
 
+    def _scale_for_display(self, frame):
+        """Return (display_frame, scale) where scale = display/original."""
+        mw, mh = self.DISPLAY_MAX
+        h, w = frame.shape[:2]
+        scale = min(mw / w, mh / h, 1.0)
+        if scale < 1.0:
+            dw, dh = int(w * scale), int(h * scale)
+            return cv2.resize(frame, (dw, dh)), scale
+        return frame.copy(), 1.0
+
     # ─── Phase 1: 4-point rectangle for homography ───────────
     def _pick_homography_points(self, frame):
-        clicks = []
+        display, scale = self._scale_for_display(frame)
+        clicks_d = []   # clicks in display coords
         window = "Phase 1/2 — Homography: click bl, br, tr, tl  (r=reset, q=quit)"
 
         def redraw():
-            img = frame.copy()
-            for i, (x, y) in enumerate(clicks):
+            img = display.copy()
+            for i, (x, y) in enumerate(clicks_d):
                 cv2.circle(img, (x, y), 6, (0, 0, 255), -1)
                 cv2.putText(img, self.POINT_LABELS[i], (x + 8, y - 8),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-            if len(clicks) >= 2:
-                for i in range(len(clicks) - 1):
-                    cv2.line(img, clicks[i], clicks[i + 1], (0, 255, 0), 2)
-            if len(clicks) == 4:
-                cv2.line(img, clicks[3], clicks[0], (0, 255, 0), 2)
-            next_idx = len(clicks)
+            if len(clicks_d) >= 2:
+                for i in range(len(clicks_d) - 1):
+                    cv2.line(img, clicks_d[i], clicks_d[i + 1], (0, 255, 0), 2)
+            if len(clicks_d) == 4:
+                cv2.line(img, clicks_d[3], clicks_d[0], (0, 255, 0), 2)
+            next_idx = len(clicks_d)
             if next_idx < 4:
                 msg = f"Phase 1/2 — Click {self.POINT_LABELS[next_idx]}"
             else:
@@ -51,81 +63,89 @@ class ManualCalibrator:
             cv2.imshow(window, img)
 
         def on_mouse(event, x, y, flags, param):
-            if event == cv2.EVENT_LBUTTONDOWN and len(clicks) < 4:
-                clicks.append((x, y))
+            if event == cv2.EVENT_LBUTTONDOWN and len(clicks_d) < 4:
+                clicks_d.append((x, y))
                 redraw()
 
-        cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+        cv2.namedWindow(window, cv2.WINDOW_AUTOSIZE)
+        cv2.imshow(window, display)
+        cv2.waitKey(1)
         cv2.setMouseCallback(window, on_mouse)
         redraw()
 
         while True:
             key = cv2.waitKey(20) & 0xFF
             if key == ord('r'):
-                clicks.clear()
+                clicks_d.clear()
                 redraw()
             elif key == ord('q'):
                 cv2.destroyWindow(window)
                 raise RuntimeError("Calibration cancelled by user")
-            elif key in (13, 10) and len(clicks) == 4:
+            elif key in (13, 10) and len(clicks_d) == 4:
                 break
 
-        cv2.destroyWindow(window)
-        return np.float32(clicks)
+        cv2.destroyAllWindows()
+        cv2.waitKey(1)
+        # unscale clicks back to original image coordinates
+        return np.float32([(x / scale, y / scale) for x, y in clicks_d])
 
     # ─── Phase 2: N-point polygon for tracking region ─────────
     def _pick_tracking_polygon(self, frame, src_pts):
-        clicks = []
+        display, scale = self._scale_for_display(frame)
+        clicks_d = []   # clicks in display coords
+        src_d = (src_pts * scale).astype(np.int32)
         window = "Phase 2/2 — Tracking region: click N points  (Enter=done, r=reset, u=undo, q=quit)"
 
         def redraw():
-            img = frame.copy()
-            # show phase-1 rectangle dimmed for reference
-            cv2.polylines(img, [src_pts.astype(np.int32)], True, (0, 200, 200), 1)
-            # current polygon
-            if len(clicks) >= 1:
-                for (x, y) in clicks:
+            img = display.copy()
+            cv2.polylines(img, [src_d], True, (0, 200, 200), 1)
+            if len(clicks_d) >= 1:
+                for (x, y) in clicks_d:
                     cv2.circle(img, (x, y), 5, (0, 255, 255), -1)
-            if len(clicks) >= 2:
-                for i in range(len(clicks) - 1):
-                    cv2.line(img, clicks[i], clicks[i + 1], (0, 255, 255), 2)
-            if len(clicks) >= 3:
-                cv2.line(img, clicks[-1], clicks[0], (0, 255, 255), 1)
+            if len(clicks_d) >= 2:
+                for i in range(len(clicks_d) - 1):
+                    cv2.line(img, clicks_d[i], clicks_d[i + 1], (0, 255, 255), 2)
+            if len(clicks_d) >= 3:
+                cv2.line(img, clicks_d[-1], clicks_d[0], (0, 255, 255), 1)
                 overlay = img.copy()
-                cv2.fillPoly(overlay, [np.array(clicks, dtype=np.int32)],
+                cv2.fillPoly(overlay, [np.array(clicks_d, dtype=np.int32)],
                              (0, 255, 255))
                 cv2.addWeighted(overlay, 0.15, img, 0.85, 0, img)
-            msg = (f"Phase 2/2 — {len(clicks)} pts  "
-                   f"(Enter when done, need >=3)")
+            msg = f"Phase 2/2 — {len(clicks_d)} pts  (Enter when done, need >=3)"
             cv2.putText(img, msg, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
                         (255, 255, 255), 2)
             cv2.imshow(window, img)
 
         def on_mouse(event, x, y, flags, param):
             if event == cv2.EVENT_LBUTTONDOWN:
-                clicks.append((x, y))
+                clicks_d.append((x, y))
                 redraw()
 
-        cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+        cv2.namedWindow(window, cv2.WINDOW_AUTOSIZE)
+        cv2.imshow(window, display)
+        cv2.waitKey(1)
         cv2.setMouseCallback(window, on_mouse)
         redraw()
 
         while True:
             key = cv2.waitKey(20) & 0xFF
             if key == ord('r'):
-                clicks.clear()
+                clicks_d.clear()
                 redraw()
-            elif key == ord('u') and clicks:
-                clicks.pop()
+            elif key == ord('u') and clicks_d:
+                clicks_d.pop()
                 redraw()
             elif key == ord('q'):
                 cv2.destroyWindow(window)
                 raise RuntimeError("Calibration cancelled by user")
-            elif key in (13, 10) and len(clicks) >= 3:
+            elif key in (13, 10) and len(clicks_d) >= 3:
                 break
 
-        cv2.destroyWindow(window)
-        return np.array(clicks, dtype=np.int32)
+        cv2.destroyAllWindows()
+        cv2.waitKey(1)
+        # unscale clicks back to original image coordinates
+        return np.array([(int(x / scale), int(y / scale)) for x, y in clicks_d],
+                        dtype=np.int32)
 
     # ─── Homography fit ───────────────────────────────────────
     def compute_homography(self, src):
@@ -183,8 +203,9 @@ class ManualCalibrator:
 
 
 if __name__ == "__main__":
-    cap = cv2.VideoCapture("in/thai_road_full.mp4")
-    calib = ManualCalibrator(lane_width_m=7.0, road_depth_m=7.0)
+    cap = cv2.VideoCapture("in/car_100kmh.mp4")
+
+    calib = ManualCalibrator(lane_width_m=7.0, road_depth_m=10.0)
     H, src = calib.calibrate(cap, save_path="H_manual.npy")
     print("H =")
     print(H)
