@@ -11,7 +11,7 @@ import cv2
 import numpy as np
 
 # ─── Config ──────────────────────────────────────────────────────
-VIDEO_PATH  = "in/car_long.mp4"
+VIDEO_PATH  = "in/car_100kmh.mp4"
 MOCK_PATH   = "mock_tracks.json"
 H_PATH      = "H_manual.npy"
 OUT_JSON    = "grid_config_cam_01.json"
@@ -29,7 +29,7 @@ HOUGH_MAX_GAP  = 20
 
 ANGLE_DIST_PX    = 200
 ANGLE_DIFF_DEG   = 12
-POLY_DEG         = 3     # polynomial degree for lane curve fitting
+POLY_DEG         = 2     # polynomial degree for lane curve fitting
 CURVE_N          = 400   # sample points along each fitted curve
 CLUSTER_EPS      = 60    # DBSCAN: max distance in combined (position + angle) space
 CLUSTER_MIN_SEGS = 3     # DBSCAN: min segments to form a cluster
@@ -143,11 +143,10 @@ def eval_curve(fit, n=CURVE_N):
 
 
 def unproject_curve(curve_px, H):
-    """Image (N,1,2) → world (N,3) [X, Y=0, Z] via ground-plane homography."""
+    """Image (N,1,2) → world (N,2) [X, Z] via ground-plane homography."""
     if len(curve_px) == 0 or H is None:
-        return np.zeros((0, 3))
-    gnd = cv2.perspectiveTransform(curve_px.astype(np.float32), H).reshape(-1, 2)
-    return np.column_stack([gnd[:, 0], np.zeros(len(gnd)), gnd[:, 1]])
+        return np.zeros((0, 2))
+    return cv2.perspectiveTransform(curve_px.astype(np.float32), H).reshape(-1, 2)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -485,72 +484,79 @@ cv2.putText(dbg6, f"{len(curves)} continuous polynomial curves",
 checkpoint("6_curves", dbg6)
 
 
+# Load homography once here — reused by Stage 6b and Stage 7
+H_gnd = np.load(H_PATH) if os.path.exists(H_PATH) else None
+H_inv = np.linalg.inv(H_gnd) if H_gnd is not None else None
+
+
 # ═══════════════════════════════════════════════════════════════════
-# Stage 6b — Global degree-3 poly, depth-penalty weighted + far-range outlier purge
+# Stage 6b — BEV polynomial fit (project to world → fit → warp back)
 # ═══════════════════════════════════════════════════════════════════
-print("=== Stage 6b: global deg-3 polynomial fit (depth-weighted) ===")
+print("=== Stage 6b: BEV deg-2 polynomial fit ===")
 
-all_valid_segs = [s for segs in valid_clusters.values() for s in segs]
+BEV_DEG    = 2   # deg-1 or 2 is stable in rectified BEV space
+global_bev_crv = np.zeros((0, 1, 2), dtype=np.int32)
+n_removed_bev  = 0
 
-# Collect all endpoints
-raw_pts = [(x, y) for s in all_valid_segs for x, y in [(s[0], s[1]), (s[2], s[3])]]
-raw_pts.sort(key=lambda p: p[1])
-ys_all = np.array([p[1] for p in raw_pts], dtype=np.float64)
-xs_all = np.array([p[0] for p in raw_pts], dtype=np.float64)
+if H_gnd is None:
+    print(f"  {H_PATH} not found — skipping BEV fit (run manual_calibrate.py)")
+else:
+    # Project per-cluster curve points (debug_6) into world (BEV) coordinates
+    # curves[lbl] shape (N,1,2) → perspectiveTransform → (N,2) world [X, Z]
+    bev_pts = []
+    for crv in curves.values():
+        if len(crv) == 0:
+            continue
+        w = cv2.perspectiveTransform(crv.astype(np.float32), H_gnd).reshape(-1, 2)
+        bev_pts.extend(zip(w[:, 0].tolist(), w[:, 1].tolist()))  # (X_world, Z_world)
 
-# Deduplicate y values
-_, idx = np.unique(ys_all, return_index=True)
-ys_u = ys_all[idx]
-xs_u = xs_all[idx]
+    bev_pts.sort(key=lambda p: p[1])   # sort by depth Z
+    Zs = np.array([p[1] for p in bev_pts], dtype=np.float64)
+    Xs = np.array([p[0] for p in bev_pts], dtype=np.float64)
 
-global_crv3 = np.zeros((0, 1, 2), dtype=np.int32)
-n_removed = 0
+    # Deduplicate Z
+    _, idx = np.unique(Zs, return_index=True)
+    Zs, Xs = Zs[idx], Xs[idx]
 
-if len(ys_u) >= 5:
-    # Pass 1: unweighted fit to establish a reference trajectory
-    c1 = np.polyfit(ys_u, xs_u, deg=3)
-    residuals = np.abs(xs_u - np.poly1d(c1)(ys_u))
+    if len(Zs) >= BEV_DEG + 2:
+        # Pass 1: initial fit → residual-based outlier rejection
+        c1_bev = np.polyfit(Zs, Xs, deg=BEV_DEG)
+        res_bev = np.abs(Xs - np.poly1d(c1_bev)(Zs))
+        thresh_bev = np.median(res_bev) + 2.0 * res_bev.std()
+        keep_bev = res_bev <= thresh_bev
+        n_removed_bev = int((~keep_bev).sum())
+        Zs_f, Xs_f = Zs[keep_bev], Xs[keep_bev]
 
-    # Pass 2: in the far range (top 40 % of image) discard points whose
-    # residual exceeds median + 2·σ of far-range residuals
-    far_mask = ys_u < frame_H * 0.60
-    if far_mask.sum() > 0:
-        far_res = residuals[far_mask]
-        thresh = np.median(far_res) + 2.0 * far_res.std()
-        keep = ~far_mask | (residuals <= thresh)
-    else:
-        keep = np.ones(len(ys_u), dtype=bool)
+        if len(Zs_f) >= BEV_DEG + 2:
+            # Pass 2: clean fit in BEV
+            c_bev = np.polyfit(Zs_f, Xs_f, deg=BEV_DEG)
+            poly_bev = np.poly1d(c_bev)
 
-    n_removed = int((~keep).sum())
-    ys_f, xs_f = ys_u[keep], xs_u[keep]
+            # Evaluate in world space, warp back to image
+            Z_ev = np.linspace(float(Zs_f.min()), float(Zs_f.max()), CURVE_N)
+            X_ev = poly_bev(Z_ev)
+            world_ev = np.column_stack([X_ev, Z_ev]).astype(np.float32).reshape(-1, 1, 2)
+            img_ev = cv2.perspectiveTransform(world_ev, H_inv).reshape(-1, 2)
+            ok = ((img_ev[:, 0] >= 0) & (img_ev[:, 0] < frame_W) &
+                  (img_ev[:, 1] >= 0) & (img_ev[:, 1] < frame_H))
+            global_bev_crv = img_ev[ok].astype(np.int32).reshape(-1, 1, 2)
 
-    if len(ys_f) >= 5:
-        c_final = np.polyfit(ys_f, xs_f, deg=3)
-        poly3 = np.poly1d(c_final)
-        y_min3, y_max3 = float(ys_f.min()), float(ys_f.max())
-        ys_ev = np.linspace(y_min3, y_max3, CURVE_N)
-        xs_ev = poly3(ys_ev)
-        ok = (xs_ev >= 0) & (xs_ev < frame_W) & (ys_ev >= 0) & (ys_ev < frame_H)
-        global_crv3 = np.column_stack([xs_ev[ok], ys_ev[ok]]).astype(np.int32).reshape(-1, 1, 2)
-
-print(f"  pts_used={len(ys_u) - n_removed}/{len(ys_u)}  far-outliers_removed={n_removed}")
+    print(f"  BEV pts={len(Zs)}  outliers_removed={n_removed_bev}  pts_used={len(Zs) - n_removed_bev}")
 
 dbg6b = ref.copy()
-# individual cluster curves (background, thinner)
 for lbl, crv in curves.items():
     if len(crv) < 2:
         continue
     cv2.polylines(dbg6b, [crv], False, _track_color(lbl), 2, cv2.LINE_AA)
 
-# global deg-3 fit — white, thicker, on top
-if len(global_crv3) > 1:
-    cv2.polylines(dbg6b, [global_crv3], False, (255, 255, 255), 3, cv2.LINE_AA)
-    bpt = tuple(global_crv3[-1, 0])
-    cv2.putText(dbg6b, "global deg-3", (bpt[0] + 8, bpt[1]),
+if len(global_bev_crv) > 1:
+    cv2.polylines(dbg6b, [global_bev_crv], False, (255, 255, 255), 3, cv2.LINE_AA)
+    bpt = tuple(global_bev_crv[-1, 0])
+    cv2.putText(dbg6b, "BEV deg-2", (bpt[0] + 8, bpt[1]),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
 
 cv2.putText(dbg6b,
-            f"global deg-3 (white)  depth-weighted  far-outliers removed={n_removed}",
+            f"BEV deg-{BEV_DEG} (white)  fit in world-space  outliers_removed={n_removed_bev}",
             (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 checkpoint("6b_global_fit", dbg6b)
 
@@ -563,14 +569,14 @@ print("=== Stage 7: 3D grid overlay ===")
 GRID_COLS = 5   # lateral divisions between lane boundaries
 GRID_ROWS = 8   # depth divisions along road
 
-H_gnd = np.load(H_PATH) if os.path.exists(H_PATH) else None
+# H_gnd and H_inv already loaded before Stage 6b
 world_curves: dict = {}
+world_grid = None   # filled by Stage 7; used by Stage 8
 
 if H_gnd is None:
     print(f"  {H_PATH} not found — run manual_calibrate.py; skipping grid overlay")
 else:
     world_curves = {lbl: unproject_curve(crv, H_gnd) for lbl, crv in curves.items()}
-    H_inv = np.linalg.inv(H_gnd)
 
     # Sort curves left → right by mean world-X
     sorted_lbls = sorted(world_curves,
@@ -584,19 +590,17 @@ else:
             w_left  = world_curves[sorted_lbls[0]]
             w_right = world_curves[sorted_lbls[-1]]
         else:
-            # Single curve: offset by estimated half-lane width
             w_c = world_curves[sorted_lbls[0]]
             w_left  = w_c.copy(); w_left[:,  0] -= 3.5
             w_right = w_c.copy(); w_right[:, 0] += 3.5
 
-        # Z range from both boundary curves
-        all_z = np.concatenate([w_left[:, 2], w_right[:, 2]])
+        all_z = np.concatenate([w_left[:, 1], w_right[:, 1]])
         z_min, z_max = float(all_z.min()), float(all_z.max())
 
         def _x_at_z(wpts, z):
-            """Interpolate world-X on a curve at a given Z depth."""
-            order = np.argsort(wpts[:, 2])
-            return float(np.interp(z, wpts[order, 2], wpts[order, 0]))
+            """Interpolate world-X on a (N,2) [X,Z] curve at a given Z depth."""
+            order = np.argsort(wpts[:, 1])
+            return float(np.interp(z, wpts[order, 1], wpts[order, 0]))
 
         def _w2px(X, Z):
             """World (X, Z) → image pixel, clamped to frame."""
@@ -607,24 +611,25 @@ else:
 
         # Build grid: (GRID_ROWS+1) depth levels × (GRID_COLS+2) lateral points
         zs = np.linspace(z_min, z_max, GRID_ROWS + 1)
-        grid = []   # list of rows; each row = list of image points
-        for z in zs:
+        grid = []
+        world_grid = np.zeros((GRID_ROWS + 1, GRID_COLS + 2, 2))
+        for ri, z in enumerate(zs):
             xl = _x_at_z(w_left,  z)
             xr = _x_at_z(w_right, z)
-            row = [_w2px(x, z) for x in np.linspace(xl, xr, GRID_COLS + 2)]
+            xs_row = np.linspace(xl, xr, GRID_COLS + 2)
+            row = [_w2px(x, z) for x in xs_row]
             grid.append(row)
+            world_grid[ri, :, 0] = xs_row
+            world_grid[ri, :, 1] = z
 
         dbg7 = ref.copy()
-        # Horizontal lines (across road at each depth)
         for row in grid:
             for i in range(len(row) - 1):
                 cv2.line(dbg7, row[i], row[i + 1], (0, 200, 255), 1, cv2.LINE_AA)
-        # Vertical lines (along road at each lateral position)
         for ci in range(GRID_COLS + 2):
             for ri in range(len(grid) - 1):
                 cv2.line(dbg7, grid[ri][ci], grid[ri + 1][ci],
                          (0, 255, 120), 1, cv2.LINE_AA)
-        # Overlay confirmed polynomial curves
         for lbl, crv in curves.items():
             if len(crv) > 1:
                 cv2.polylines(dbg7, [crv], False, _track_color(lbl), 2, cv2.LINE_AA)
@@ -634,64 +639,6 @@ else:
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         checkpoint("7_grid_overlay", dbg7)
 
-
-# ═══════════════════════════════════════════════════════════════════
-# Stage 8 — Matplotlib 3D surface (saved to file, no interactive pause)
-# ═══════════════════════════════════════════════════════════════════
-print("=== Stage 8: 3D surface plot ===")
-
-if H_gnd is None:
-    print("  Skipping (no H_manual.npy)")
-else:
-
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        import colorsys
-
-        fig = plt.figure(figsize=(13, 7))
-        ax  = fig.add_subplot(111, projection="3d")
-
-        lbls_sorted = sorted(world_curves)
-        for lbl in lbls_sorted:
-            world = world_curves[lbl]
-            if len(world) == 0:
-                continue
-            h = (lbl * 0.618) % 1.0
-            r, g, b = colorsys.hsv_to_rgb(h, 0.8, 0.9)
-            ax.plot(world[:, 0], world[:, 1], world[:, 2],
-                    color=(r, g, b), linewidth=2, label=f"C{lbl}")
-
-        # Mesh between consecutive curve pairs
-        for i in range(len(lbls_sorted) - 1):
-            wa = world_curves[lbls_sorted[i]]
-            wb = world_curves[lbls_sorted[i + 1]]
-            n = min(len(wa), len(wb), 60)
-            if n < 2:
-                continue
-            ia = np.linspace(0, len(wa) - 1, n).astype(int)
-            ib = np.linspace(0, len(wb) - 1, n).astype(int)
-            wa_s, wb_s = wa[ia], wb[ib]
-            m = 6
-            Xg = np.array([np.linspace(wa_s[j, 0], wb_s[j, 0], m) for j in range(n)])
-            Zg = np.array([np.linspace(wa_s[j, 2], wb_s[j, 2], m) for j in range(n)])
-            Yg = np.zeros_like(Xg)
-            ax.plot_surface(Xg, Yg, Zg, alpha=0.25,
-                            color="lightsteelblue", linewidth=0.2, edgecolor="navy")
-
-        ax.set_xlabel("X  (m)")
-        ax.set_ylabel("Y  (m)")
-        ax.set_zlabel("Z  (m depth)")
-        ax.set_title("3D Road Surface Mesh")
-        ax.legend()
-        ax.view_init(elev=25, azim=-55)
-        fig.tight_layout()
-        fig.savefig("debug_7_3d_surface.png", dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        print("  Saved debug_7_3d_surface.png")
-    except ImportError:
-        print("  matplotlib not available — pip install matplotlib for 3D plot")
 
 # ── Save JSON ────────────────────────────────────────────────────
 config: dict = {
@@ -712,10 +659,10 @@ for lbl, fit in fits.items():
         "degree": int(len(poly.coeffs) - 1),
     }
     if H_gnd is not None:
-        world = world_curves.get(lbl, np.zeros((0, 3)))
+        world = world_curves.get(lbl, np.zeros((0, 2)))
         if len(world) > 0:
             entry["world_XZ_samples"] = [
-                [round(float(p[0]), 3), round(float(p[2]), 3)]
+                [round(float(p[0]), 3), round(float(p[1]), 3)]
                 for p in world[::10]
             ]
     config["curves"][str(lbl)] = entry

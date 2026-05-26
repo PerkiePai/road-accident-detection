@@ -2,7 +2,7 @@ import cv2
 import json
 import numpy as np
 
-VIDEO_PATH = "in/car_long.mp4"
+VIDEO_PATH = "in/car_100kmh.mp4"
 MOCK_PATH  = "mock_tracks.json"
 
 cap = cv2.VideoCapture(VIDEO_PATH)
