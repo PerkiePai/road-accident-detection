@@ -8,6 +8,7 @@ from ultralytics import YOLO
 
 # ─── Config ────────────────────────────────────────────────────
 INPUT_VIDEO   = "in/car_100kmh.mp4"
+model = YOLO("yolo11n.pt")
 OUTPUT_VIDEO  = "car_100kmh_tracked.mp4"
 H_PATH        = "H_manual.npy"
 SRC_PATH      = "src_manual.npy"
@@ -19,7 +20,7 @@ BBOX_EMA      = 0.6          # bbox smoothing — visual only
 GP_EMA        = 0.75         # ground-point (tracking point) smoothing — drives projection & speed
 PANEL_SIZE    = (340, 200)   # (w, h) of the speed panel
 PANEL_MARGIN  = 20
-PANEL_VMAX_KMH_FLOOR = 60.0  # y-axis upper bound floor
+PANEL_VMAX_KMH_FLOOR = 120  # y-axis upper bound floor
 
 # ─── Re-ID stitcher (Layer B) ─────────────────────────────────
 REID_DIST_BASE_M    = 2.0    # match radius at z=0
@@ -40,7 +41,7 @@ src_rect   = np.load(SRC_PATH).astype(np.int32)    # 4-pt homography rectangle (
 road_poly  = np.load(TRACK_PATH).astype(np.int32)  # N-pt tracking region
 
 # ─── Video I/O ─────────────────────────────────────────────────
-model = YOLO("yolo11m.pt")
+
 cap = cv2.VideoCapture(INPUT_VIDEO)
 if not cap.isOpened():
     raise SystemExit(f"Could not open {INPUT_VIDEO}")
@@ -90,8 +91,8 @@ class ReIDStitcher:
         self.active = {}   # canonical_id -> {t, pos, vel}
         self.lost = {}     # canonical_id -> {t, pos, vel}
 
-    def _dist_thresh(self, z_m):
-        return REID_DIST_BASE_M + REID_DIST_PER_M * max(z_m, 0.0)
+    def _dist_thresh(self, x_m, z_m):
+        return REID_DIST_BASE_M + REID_DIST_PER_M * (max(z_m, 0.0) + abs(x_m))
 
     def _update_state(self, cid, t, x, z):
         prev = self.active.get(cid)
@@ -101,8 +102,8 @@ class ReIDStitcher:
                 vx = (x - prev['pos'][0]) / dt
                 vz = (z - prev['pos'][1]) / dt
                 pvx, pvz = prev['vel']
-                vx = 0.7 * pvx + 0.3 * vx
-                vz = 0.7 * pvz + 0.3 * vz
+                vx = 0.5 * pvx + 0.5 * vx
+                vz = 0.5 * pvz + 0.5 * vz
             else:
                 vx, vz = prev['vel']
             self.active[cid] = {'t': t, 'pos': (x, z), 'vel': (vx, vz)}
@@ -143,7 +144,7 @@ class ReIDStitcher:
                 px = st['pos'][0] + st['vel'][0] * dt
                 pz = st['pos'][1] + st['vel'][1] * dt
                 dist = float(np.hypot(x_m - px, z_m - pz))
-                if dist < self._dist_thresh(z_m) and dist < best_dist:
+                if dist < self._dist_thresh(x_m, z_m) and dist < best_dist:
                     best_cid, best_dist = cid, dist
             if best_cid is not None:
                 used.add(best_cid)
@@ -187,6 +188,51 @@ def draw_road_overlay(frame, poly):
     cv2.fillPoly(overlay, [poly], (255, 200, 0))
     cv2.addWeighted(overlay, 0.20, frame, 0.80, 0, frame)
     cv2.polylines(frame, [poly], isClosed=True, color=(255, 220, 0), thickness=2)
+
+
+def draw_perspective_grid(frame, H, x_step=7.0, z_step=10.0, alpha=0.4):
+    H_inv = np.linalg.inv(H)
+    fh, fw = frame.shape[:2]
+    color = (0, 255, 255)  # BGR yellow
+    overlay = frame.copy()
+    rect = (0, 0, fw - 1, fh - 1)
+
+    # Visible world bounds from frame corners
+    corners = np.array(
+        [[[0., 0.]], [[fw - 1., 0.]], [[fw - 1., fh - 1.]], [[0., fh - 1.]]],
+        dtype=np.float32,
+    )
+    wc = cv2.perspectiveTransform(corners, H)[:, 0, :]
+    x_min = float(wc[:, 0].min()) - x_step
+    x_max = float(wc[:, 0].max()) + x_step
+    z_min = float(wc[:, 1].min()) - z_step
+    z_max = float(wc[:, 1].max()) + z_step
+
+    def to_img(xm, zm):
+        p = cv2.perspectiveTransform(
+            np.array([[[xm, zm]]], dtype=np.float32), H_inv
+        )[0, 0]
+        return (int(np.clip(round(p[0]), -32767, 32767)),
+                int(np.clip(round(p[1]), -32767, 32767)))
+
+    def draw_world_line(x0, z0, x1, z1):
+        ok, p0, p1 = cv2.clipLine(rect, to_img(x0, z0), to_img(x1, z1))
+        if ok:
+            cv2.line(overlay, p0, p1, color, 1, cv2.LINE_AA)
+
+    # Vertical lines every x_step metres (constant X)
+    xi = np.floor(x_min / x_step) * x_step
+    while xi <= x_max:
+        draw_world_line(xi, z_min, xi, z_max)
+        xi += x_step
+
+    # Horizontal lines every z_step metres (constant Z)
+    zi = np.floor(z_min / z_step) * z_step
+    while zi <= z_max:
+        draw_world_line(x_min, zi, x_max, zi)
+        zi += z_step
+
+    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
 
 
 def draw_speed_panel(frame, speed_history, ema_speed, t_now):
@@ -278,6 +324,7 @@ while cap.isOpened():
 
     draw_road_overlay(frame, road_poly)
     cv2.polylines(frame, [src_rect], isClosed=True, color=(0, 200, 200), thickness=1)
+    draw_perspective_grid(frame, H)
 
     boxes = results[0].boxes
     ids = boxes.id.int().cpu().tolist() if boxes.id is not None else [None] * len(boxes)
@@ -304,28 +351,30 @@ while cap.isOpened():
         cid = remap.get(raw_id, raw_id)  # None stays None
 
         # Smooth bbox per canonical id (visual only; metric flow uses raw)
-        if cid is not None and cid in bbox_smooth:
-            px1, py1_, px2, py2 = bbox_smooth[cid]
-            sx1 = BBOX_EMA * px1 + (1 - BBOX_EMA) * x1b
-            sy1 = BBOX_EMA * py1_ + (1 - BBOX_EMA) * y1b
-            sx2 = BBOX_EMA * px2 + (1 - BBOX_EMA) * x2b
-            sy2 = BBOX_EMA * py2 + (1 - BBOX_EMA) * y2b
-        else:
-            sx1, sy1, sx2, sy2 = float(x1b), float(y1b), float(x2b), float(y2b)
-        if cid is not None:
-            bbox_smooth[cid] = (sx1, sy1, sx2, sy2)
+        # if cid is not None and cid in bbox_smooth:
+        #     px1, py1_, px2, py2 = bbox_smooth[cid]
+        #     sx1 = BBOX_EMA * px1 + (1 - BBOX_EMA) * x1b
+        #     sy1 = BBOX_EMA * py1_ + (1 - BBOX_EMA) * y1b
+        #     sx2 = BBOX_EMA * px2 + (1 - BBOX_EMA) * x2b
+        #     sy2 = BBOX_EMA * py2 + (1 - BBOX_EMA) * y2b
+        # else:
+        #     sx1, sy1, sx2, sy2 = float(x1b), float(y1b), float(x2b), float(y2b)
+        # if cid is not None:
+        #     bbox_smooth[cid] = (sx1, sy1, sx2, sy2)
+        sx1, sy1, sx2, sy2 = float(x1b), float(y1b), float(x2b), float(y2b)
 
         dx1, dy1, dx2, dy2 = int(sx1), int(sy1), int(sx2), int(sy2)
 
         # Smooth ground point (the actual tracking target) per cid — separate from bbox
-        if cid is not None and cid in gp_smooth:
-            pgx, pgy = gp_smooth[cid]
-            sgx = GP_EMA * pgx + (1 - GP_EMA) * gx
-            sgy = GP_EMA * pgy + (1 - GP_EMA) * gy
-        else:
-            sgx, sgy = float(gx), float(gy)
-        if cid is not None:
-            gp_smooth[cid] = (sgx, sgy)
+        # if cid is not None and cid in gp_smooth:
+        #     pgx, pgy = gp_smooth[cid]
+        #     sgx = GP_EMA * pgx + (1 - GP_EMA) * gx
+        #     sgy = GP_EMA * pgy + (1 - GP_EMA) * gy
+        # else:
+        #     sgx, sgy = float(gx), float(gy)
+        # if cid is not None:
+        #     gp_smooth[cid] = (sgx, sgy)
+        sgx, sgy = float(gx), float(gy)
         dgx, dgy = int(sgx), int(sgy)
 
         # Project smoothed ground point → smoothed metric coords
